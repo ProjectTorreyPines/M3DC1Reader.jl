@@ -20,6 +20,10 @@ set -euo pipefail
 # many concurrent opens. This runner only writes files it alone owns, so disabling
 # the lock is safe. (Respects an already-set value.)
 export HDF5_USE_FILE_LOCKING="${HDF5_USE_FILE_LOCKING:-FALSE}"
+# libgomp (pulled in by Julia's native deps) ABORTS on a non-numeric
+# OMP_NUM_THREADS, which some Stellar modules leave set to a non-integer.
+# Normalize it here so the script works from any shell, not just the SLURM one.
+[[ "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]] || export OMP_NUM_THREADS=1
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"

@@ -3,7 +3,9 @@
 #
 # For each run folder (one containing C1.h5) it writes ALL outputs into
 #     $OUTBASE/<basename of run folder>        e.g.  .../MHD_DB/C1_76095/
-# using scripts/export_run (→ M3DC1_axisym.h5 + ascot/ascot_input_<idx>.h5), then renders
+# using scripts/export_run (→ M3DC1_axisym.h5, M3DC1_axisym_cocos11.h5 and
+# ascot/ascot_input_<idx>.h5), copies the run's provenance inputs into
+# source/ (geqdsk etc. — see DO_COPY), then renders
 # the equilibrium+profiles frames/movie there via scripts/plot_equilibrium
 # (→ <outdir>/axisym_fields_plots/).
 #
@@ -26,6 +28,10 @@
 #   PLOT_OPTS    extra flags for plot_equilibrium(e.g. "--fps=12 --format=gif")
 #   DO_EXPORT    1|0 run the export step         (default: 1)
 #   DO_PLOT      1|0 run the plot step           (default: 1)
+#   DO_COPY      1|0 copy the run's provenance files into <outdir>/source/
+#                    (default: 1) — geqdsk, eqdsk-out, C1input*, analytic.txt.
+#                    NOT equilibrium.h5 (2-17 GB, and redundant with C1.h5).
+#   COPY_FILES   override that file list (space-separated names)
 #   FORCE        1 re-run even if outputs exist  (default: 0 = resume/skip existing)
 #   DRYRUN       1 preview reads/writes, run nothing   (or pass -n / --dry-run)
 #   RANK/NRANKS  manual shard (worker r of N); normally auto-detected from SLURM
@@ -49,13 +55,46 @@ shopt -s nullglob
     { awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0"; exit 0; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# libgomp aborts on a non-numeric OMP_NUM_THREADS (some Stellar modules set one);
+# GR needs a headless device when plotting. Both are inherited by every child.
+[[ "${OMP_NUM_THREADS:-}" =~ ^[1-9][0-9]*$ ]] || export OMP_NUM_THREADS=1
+export GKSwstype="${GKSwstype:-100}"
+export HDF5_USE_FILE_LOCKING="${HDF5_USE_FILE_LOCKING:-FALSE}"
 OUTBASE="${OUTBASE:-/scratch/gpfs/myoo/MHD_DB}"
 EXPORT_OPTS="${EXPORT_OPTS:-}"
 PLOT_OPTS="${PLOT_OPTS:-}"
 DO_EXPORT="${DO_EXPORT:-1}"
 DO_PLOT="${DO_PLOT:-1}"
+DO_COPY="${DO_COPY:-1}"
 FORCE="${FORCE:-0}"
 DRYRUN="${DRYRUN:-0}"
+
+# Provenance files copied verbatim from the run folder into $outdir/source/.
+# These are the inputs the export CANNOT reconstruct: the EFIT equilibrium the
+# run started from, M3D-C1's echo of it, the profile tables it read, and the
+# namelists that say how it was configured. Entries may be glob patterns; they
+# are matched inside the run folder. All are a few kB (the geqdsk up to 4 MB).
+# Deliberately NOT equilibrium.h5 (2-17 GB, and only the t=0 field snapshot,
+# which C1.h5's time_000 already carries) nor C1stdout (~50 MB of log).
+# Symlinks are dereferenced (these usually point at the parent equilibrium run).
+COPY_FILES="${COPY_FILES:-geqdsk eqdsk-out C1input C1input_2d C1input_3d analytic.txt profilesdb-* profile_te profile_ne pellet.dat}"
+# Split into an array with globbing OFF, so patterns survive to be matched
+# against the RUN folder later (with nullglob on, `profilesdb-*` would
+# otherwise be expanded against the cwd here and vanish).
+set -f;  _COPY_PATS=($COPY_FILES);  set +f
+
+# Are all the files this configuration would produce already present?
+# export_run writes M3DC1_axisym.h5 plus, unless the COCOS-11 twin is turned off
+# (--cocos11=false, or --cocos=11 where the twin is redundant), M3DC1_axisym_cocos11.h5.
+_outputs_complete() {
+    local d="$1"
+    [[ -s "$d/M3DC1_axisym.h5" ]] || return 1
+    case " $EXPORT_OPTS " in
+        *" --cocos11=false"*|*" --cocos11=off"*|*" --cocos11=no"*|*" --cocos11=0"*) return 0 ;;
+        *" --cocos=11"*) return 0 ;;
+    esac
+    [[ -s "$d/M3DC1_axisym_cocos11.h5" ]]
+}
 
 # Parallel sharding: which worker am I, of how many? Manual RANK/NRANKS wins;
 # else auto-detect srun tasks, then a job array; else a single rank of one.
@@ -141,7 +180,7 @@ N=${#runs[@]}
 [[ "$DRYRUN" == "1" ]] &&
     echo "scan_export: DRY RUN — resolving inputs/outputs only, nothing is written"
 rbanner=""; [[ "$NRANKS" -gt 1 ]] && rbanner="  [rank $RANK/$NRANKS]"
-echo "scan_export: $N run(s) → $OUTBASE$rbanner   (export=$DO_EXPORT plot=$DO_PLOT force=$FORCE dryrun=$DRYRUN)"
+echo "scan_export: $N run(s) → $OUTBASE$rbanner   (export=$DO_EXPORT plot=$DO_PLOT copy=$DO_COPY force=$FORCE dryrun=$DRYRUN)"
 [[ "$NRANKS" -eq 1 ]] && printf '  %s\n' "${runs[@]}"
 
 # --- process each ------------------------------------------------------------
@@ -155,9 +194,13 @@ for run in "${runs[@]}"; do
     name="$(basename "$run")"
     outdir="$OUTBASE/$name"
 
-    # decide what each step would do (identical logic for dry-run and real run)
+    # decide what each step would do (identical logic for dry-run and real run).
+    # "already done" must mean EVERY expected output, not just the first: a run
+    # that died between the two writes leaves M3DC1_axisym.h5 alone, and a
+    # resume pass keyed on that one file would skip it forever with the twin
+    # silently missing. (That is exactly how C1_965307 / iter_single were lost.)
     if [[ "$DO_EXPORT" != "1" ]]; then ex="off"
-    elif [[ "$FORCE" != "1" && -f "$outdir/M3DC1_axisym.h5" ]]; then ex="skip"
+    elif [[ "$FORCE" != "1" ]] && _outputs_complete "$outdir"; then ex="skip"
     else ex="run"; fi
     plots="$outdir/axisym_fields_plots"
     if [[ "$DO_PLOT" != "1" ]]; then pl="off"
@@ -173,6 +216,15 @@ for run in "${runs[@]}"; do
     if [[ "$DRYRUN" == "1" ]]; then       # preview only — show the exact commands
         [[ "$ex" == "run" ]] &&
             echo "     export_run $run --outdir=$outdir $EXPORT_OPTS"
+        if [[ "$DO_COPY" == "1" ]]; then
+            have=""
+            for pat in "${_COPY_PATS[@]}"; do
+                for src in "$run"/$pat; do
+                    [[ -e "$src" ]] && have="$have $(basename "$src")"
+                done
+            done
+            [[ -n "$have" ]] && echo "     cp -L$have  →  $outdir/source/"
+        fi
         [[ "$pl" == "run" ]] &&
             echo "     plot_equilibrium $outdir $PLOT_OPTS"
         ok+=("$name")
@@ -189,6 +241,41 @@ for run in "${runs[@]}"; do
                 || { echo "  export: FAILED" >&2; step_failed=1; } ;;
         skip) echo "  export: skip (M3DC1_axisym.h5 exists; set FORCE=1 to redo)" ;;
     esac
+
+    # provenance copy — independent of the export step (cheap, always refreshed)
+    if [[ "$DO_COPY" == "1" ]]; then
+        mkdir -p "$outdir/source"
+        copied=0
+        for pat in "${_COPY_PATS[@]}"; do
+            for src in "$run"/$pat; do          # patterns glob inside the run folder
+                [[ -f "$src" ]] || continue
+                if cp -Lf "$src" "$outdir/source/$(basename "$src")" 2>/dev/null; then
+                    copied=$((copied + 1))
+                else
+                    echo "  copy: WARN could not copy $(basename "$src")" >&2
+                fi
+            done
+        done
+        cat > "$outdir/source/README.txt" <<EOF
+Verbatim copies of the M3D-C1 run inputs, for provenance and cross-checking.
+Source: $run
+
+  geqdsk          the EFIT equilibrium M3D-C1 was started from (iread_eqdsk)
+  eqdsk-out       M3D-C1's echo of it (press, pprime, fpol, ffprim, qpsi)
+  profilesdb-*    the equilibrium profile tables (ffprime, pprime, g, p, w)
+  profile_te/_ne  the Te / ne profiles read when iread_te / iread_ne = 1
+  pellet.dat      the SPI pellet trajectory input
+  C1input*        the M3D-C1 namelists (iread_p, kprad, imulti_region, ...)
+
+NOT the exported equilibrium. M3D-C1 re-solves Grad-Shafranov on its own mesh
+at startup, so even its t=0 state differs from this geqdsk (measured on the JET
+SPI case: magnetic axis moved 4.6 mm, q95 by 1.7%, pressure by 1-2%). The
+equilibrium M3D-C1 actually evolved is the one in ../M3DC1_axisym.h5.
+Sign conventions also differ per device: the exported psi runs opposite to the
+geqdsk on some runs (see docs/cocos_conventions.md).
+EOF
+        echo "  copy: $copied file(s) → source/"
+    fi
 
     if [[ $step_failed -eq 0 ]]; then
         case "$pl" in

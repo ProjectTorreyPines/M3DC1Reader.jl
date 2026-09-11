@@ -19,7 +19,7 @@
 #SBATCH --ntasks=26              # = number of parallel ranks (NRANKS)
 #SBATCH --cpus-per-task=1       # cores each export/plot gets
 #SBATCH --mem-per-cpu=8G
-#SBATCH --time=00:30:00
+#SBATCH --time=01:30:00
 #SBATCH --output=scan_%j.log    # combined log (srun --label prefixes each rank)
 
 set -euo pipefail
@@ -36,7 +36,7 @@ export HDF5_USE_FILE_LOCKING="${HDF5_USE_FILE_LOCKING:-FALSE}"
 
 # ---- EDIT THESE (the run list is normally passed as sbatch argument(s)) ------
 REPO=/scratch/gpfs/myoo/M3DC1Reader          # clone containing scripts/
-export OUTBASE=/scratch/gpfs/myoo/M3DC1_DB     # output root ($OUTBASE/<run name>/)
+export OUTBASE="${OUTBASE:-/scratch/gpfs/myoo/M3DC1_DB}"     # output root ($OUTBASE/<run name>/)
 export EXPORT_OPTS=""                        # e.g. "--slices=0,24"; "" = all slices
 export PLOT_OPTS=""                          # e.g. "--fps=12"
 export FORCE="${FORCE:-0}"                   # 1 = overwrite existing outputs (else skip/resume);
@@ -53,14 +53,27 @@ if [[ $# -gt 0 ]]; then inputs=("$@"); else inputs=("$DEFAULT_LIST"); fi
 echo "scan_export.slurm: inputs=[${inputs[*]}]  OUTBASE=$OUTBASE  ntasks=${SLURM_NTASKS:-1}"
 [[ -e "${inputs[0]}" ]] || { echo "ERROR: input '${inputs[0]}' not found" >&2; exit 1; }
 
-command -v julia >/dev/null 2>&1 || module load julia 2>/dev/null || true
+# Julia on the compute node. `module` is not defined in a non-interactive batch
+# shell until modules.sh is sourced, and `module load julia` alone fails with
+# "No default version defined" — so source it and pin the version. JULIA_MODULE
+# can override (must match what the depot in ~/.julia was precompiled against).
+if ! command -v julia >/dev/null 2>&1; then
+    [[ -r /etc/profile.d/modules.sh ]] && source /etc/profile.d/modules.sh
+    module load "${JULIA_MODULE:-julia/1.12.1}" || {
+        echo "ERROR: could not load ${JULIA_MODULE:-julia/1.12.1}" >&2; exit 1; }
+fi
+command -v julia >/dev/null 2>&1 || { echo "ERROR: julia not on PATH" >&2; exit 1; }
+echo "julia: $(command -v julia)  ($(julia --version))"
 
 # Warm the precompile caches ONCE so the N ranks don't race on first-time
 # precompilation of the package / plotting deps (concurrent first compiles of the
 # same package thrash the shared depot). Both envs export_run/plot use:
 echo "warmup: precompiling Julia deps…"
 julia --project="$REPO" -e 'using M3DC1Reader' >/dev/null
-julia -e 'using Plots, HDF5' >/dev/null        # default env (plot_equilibrium)
+# plotting deps only when the plot step will actually run (DO_PLOT=0 skips them,
+# and a missing Plots in the default env must not abort an export-only scan)
+[[ "$DO_PLOT" == "1" ]] && { julia -e 'using Plots, HDF5' >/dev/null || {
+    echo "WARN: plotting deps unavailable; plot step will fail per-run" >&2; }; }
 
 # Launch NRANKS = $SLURM_NTASKS workers; scan_export auto-detects the rank from
 # SLURM_PROCID/SLURM_NTASKS and takes its share. --label prefixes lines by task.

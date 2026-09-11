@@ -42,3 +42,6 @@ Thumbs.db
 
 # Jupyter notebook checkpoints
 .ipynb_checkpoints/
+
+# SLURM scan logs
+scan_*.log

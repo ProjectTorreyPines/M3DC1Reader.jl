@@ -10,14 +10,33 @@
 Serialize `ir` (keys = dotted IMAS paths, e.g.
 `"core_profiles.profiles_1d.0.electrons.temperature"`) into an OMAS-compatible
 HDF5 file at `path`. Overwrites `path`.
+
+The write is **atomic**: it goes to a unique temporary file in the same
+directory and is `mv`d into place only after the HDF5 file is closed cleanly.
+So `path` is either absent or a complete, readable file — never a half-written
+one. This matters for batch scans, where an interrupted or duplicated writer
+would otherwise leave a truncated file whose HDF5 object headers fail to
+deserialize ("bad object header version number") and which a resume pass would
+then happily *skip* as already done. The temp file is removed on failure.
 """
 function write_omas_h5(path::AbstractString, ir::AbstractDict)
-    h5open(String(path), "w") do f
-        for (key, val) in ir
-            _write_omas_leaf!(f, String(key), val)
+    out = String(path)
+    dir = dirname(out);  isempty(dir) && (dir = ".")
+    mkpath(dir)
+    # same directory ⇒ the rename is atomic (a cross-filesystem mv would not be)
+    tmp = joinpath(dir, "." * basename(out) * ".tmp-" * string(getpid()))
+    try
+        h5open(tmp, "w") do f
+            for (key, val) in ir
+                _write_omas_leaf!(f, String(key), val)
+            end
         end
+        mv(tmp, out; force = true)
+    catch
+        rm(tmp; force = true)
+        rethrow()
     end
-    return String(path)
+    return out
 end
 
 function _write_omas_leaf!(f::Union{HDF5.File, HDF5.Group}, key::AbstractString, val)
