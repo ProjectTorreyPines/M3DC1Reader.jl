@@ -68,7 +68,7 @@ export average_toroidal_axisymmetric, average_toroidal_axisymmetric!,
 
 # ---- magnetic axis / critical points / LCFS ----
 export mesh_zone_boundary_rz, elem_zones
-export find_axis_newton, locate_element
+export find_axis_newton, locate_element, trace_lcfs
 export damped_newton_2d, critical_point_system, classify_critical,
     find_critical_point, find_o_point, find_x_point, find_lcfs
 

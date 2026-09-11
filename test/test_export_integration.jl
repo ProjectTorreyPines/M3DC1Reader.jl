@@ -39,29 +39,32 @@
         h5open(outraw, "r") do fr
             # ψ ×2π everywhere (grid, 2D map, boundary scalar)
             @test read(f11["equilibrium/time_slice/0/global_quantities/psi_boundary"]) ≈
-                2π * read(fr["equilibrium/time_slice/0/global_quantities/psi_boundary"])
+                -2π * read(fr["equilibrium/time_slice/0/global_quantities/psi_boundary"])
             p11 = read(f11["core_profiles/profiles_1d/0/grid/psi"])
             praw = read(fr["core_profiles/profiles_1d/0/grid/psi"])
-            @test p11 ≈ 2π .* praw
+            @test p11 ≈ -2π .* praw
             m11 = read(f11["equilibrium/time_slice/0/profiles_2d/0/psi"])
             mraw = read(fr["equilibrium/time_slice/0/profiles_2d/0/psi"])
-            @test isapprox(m11, 2π .* mraw; nans = true)
-            # q and F are frame quantities — identical in both conventions
-            @test isequal(
+            @test isapprox(m11, -2π .* mraw; nans = true)
+            # q flips with σ_ρθφ (Q = −1 for cocos_transform(3, 11))
+            @test isapprox(
                 read(f11["core_profiles/profiles_1d/0/q"]),
-                read(fr["core_profiles/profiles_1d/0/q"])
+                -1 .* read(fr["core_profiles/profiles_1d/0/q"]); nans = true
             )
+            # F is a frame quantity — identical in both conventions
             @test isequal(
                 read(f11["equilibrium/time_slice/0/profiles_1d/f"]),
                 read(fr["equilibrium/time_slice/0/profiles_1d/f"])
             )
-            # ip: raw keeps totcur's sign; cocos=11 flips it to the field frame
+            # ip is NEVER touched by a COCOS transform (IP = +1 for 3 → 11): both
+            # files carry M3D-C1's `toroidal_current` verbatim. A flip here was a
+            # structural bug — it reverses sign(Ip·B0), the magnetic helicity.
             @test read(fr["summary/global_quantities/ip/value"]) ≈ [-0.5 * uI]
-            @test read(f11["summary/global_quantities/ip/value"]) ≈ [0.5 * uI]
-            @test read(f11["equilibrium/time_slice/0/global_quantities/ip"]) ≈ 0.5 * uI
+            @test read(f11["summary/global_quantities/ip/value"]) ≈ [-0.5 * uI]
+            @test read(f11["equilibrium/time_slice/0/global_quantities/ip"]) ≈ -0.5 * uI
             # the convention is recorded in the comment
             @test occursin("COCOS-11", read(f11["core_profiles/ids_properties/comment"]))
-            @test occursin("per-radian", read(fr["core_profiles/ids_properties/comment"]))
+            @test occursin("COCOS 3", read(fr["core_profiles/ids_properties/comment"]))
         end
     end
 
@@ -71,23 +74,63 @@
     export_imas(file, outdb; slices = [1], nbins = 16, ngrid = 40, cocos = :mhdsimdb)
     h5open(outdb, "r") do fdb
         h5open(outraw, "r") do fr
-            # equilibrium block: identical to the raw per-radian output
+            # equilibrium block: identical to the raw native-COCOS-3 output
             @test read(fdb["equilibrium/time_slice/0/global_quantities/psi_boundary"]) ≈
                 read(fr["equilibrium/time_slice/0/global_quantities/psi_boundary"])
             @test read(fdb["equilibrium/time_slice/0/profiles_1d/psi"]) ≈
                 read(fr["equilibrium/time_slice/0/profiles_1d/psi"])
+            @test isequal(
+                read(fdb["equilibrium/time_slice/0/profiles_1d/q"]),
+                read(fr["equilibrium/time_slice/0/profiles_1d/q"])
+            )
             # cp grid.psi: axis-zeroed total flux, 2π·(ψ−ψ_axis)
             praw = read(fr["core_profiles/profiles_1d/0/grid/psi"])
             pa = read(fr["equilibrium/time_slice/0/global_quantities/psi_axis"])
             pdb = read(fdb["core_profiles/profiles_1d/0/grid/psi"])
             @test pdb ≈ 2π .* (praw .- pa)
             @test pdb[1] ≈ 0.0 atol = 1.0e-12               # zero at the axis node
-            # ip gets the same field-frame flip as cocos=11
-            @test read(fdb["summary/global_quantities/ip/value"]) ≈ [0.5 * uI]
+            # ip is unmodified here too
+            @test read(fdb["summary/global_quantities/ip/value"]) ≈ [-0.5 * uI]
             @test occursin("MHDsimDB", read(fdb["core_profiles/ids_properties/comment"]))
         end
     end
-    rm(p; force = true); rm(out11; force = true); rm(outraw; force = true); rm(outdb; force = true)
+    # `cocos11_path`: the same reduction written twice. The twin must be
+    # byte-for-byte what a standalone cocos=11 run produces, so a consumer that
+    # wants IMAS-standard psi never needs the (multi-GB) slice files re-read.
+    outdb2 = tempname() * ".h5";  outtwin = tempname() * ".h5"
+    ret = export_imas(
+        file, outdb2; slices = [1], nbins = 16, ngrid = 40,
+        cocos = :mhdsimdb, cocos11_path = outtwin
+    )
+    @test ret == (outdb2, outtwin)
+    @test isfile(outtwin)
+    h5open(outtwin, "r") do ft
+        h5open(out11, "r") do f11
+            for path in (
+                    "equilibrium/time_slice/0/profiles_1d/psi",
+                    "equilibrium/time_slice/0/profiles_1d/f",
+                    "core_profiles/profiles_1d/0/grid/psi",
+                    "equilibrium/time_slice/0/global_quantities/psi_axis",
+                )
+                @test isapprox(read(ft[path]), read(f11[path]); nans = true)
+            end
+            @test occursin("COCOS-11", read(ft["equilibrium/ids_properties/comment"]))
+        end
+        # …while the primary output stayed in the MHDsimDB layout
+        h5open(outdb2, "r") do fd
+            @test read(ft["equilibrium/time_slice/0/global_quantities/psi_axis"]) ≈
+                -2π * read(fd["equilibrium/time_slice/0/global_quantities/psi_axis"])
+            @test occursin("MHDsimDB", read(fd["equilibrium/ids_properties/comment"]))
+        end
+    end
+    # redundant when the primary output already IS cocos=11
+    @test_throws ArgumentError export_imas(
+        file, tempname() * ".h5"; slices = [1], nbins = 16, ngrid = 40,
+        cocos = 11, cocos11_path = tempname() * ".h5"
+    )
+
+    rm(p; force = true); rm(out11; force = true); rm(outraw; force = true)
+    rm(outdb; force = true); rm(outdb2; force = true); rm(outtwin; force = true)
 end
 
 @testitem "export pipeline integration (compute→assemble→write, no data file)" begin

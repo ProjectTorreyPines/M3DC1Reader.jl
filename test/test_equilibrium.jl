@@ -79,9 +79,9 @@ end
     rm(p; force = true)
 end
 
-@testitem "to_cocos: per-radian → COCOS-11" begin
+@testitem "to_cocos: native COCOS-3 → COCOS-11" begin
     eq = M3DAxisymField(;
-        time = 1.5, R = range(1.0, 2.0; length = 4),   # default cocos=1
+        time = 1.5, R = range(1.0, 2.0; length = 4),   # default cocos=3
         Z = range(-1.0, 1.0; length = 4), psi_rz = fill(0.1, 4, 4),
         psi1d = [0.0, 0.5, 1.0], F1d = [-3.0, -3.0, -3.0],
         p1d = [2.0, 1.0, 0.5], q1d = [-1.0, -1.5, NaN],
@@ -90,13 +90,16 @@ end
     )
     eq11 = to_cocos(eq, 11)
     @test eq11.cocos == 11
-    # ψ-like quantities ×2π
-    @test eq11.psi1d ≈ 2π .* eq.psi1d
-    @test eq11.psi_rz ≈ 2π .* eq.psi_rz
+    # cocos_transform(3,11): ψ ×(−2π) because M3D-C1 is σ_Bp = −1
+    @test eq11.psi1d ≈ -2π .* eq.psi1d
+    @test eq11.psi_rz ≈ -2π .* eq.psi_rz
     @test eq11.psi_axis == 0.0
-    @test eq11.psi_boundary ≈ 2π
-    # frame quantities untouched (q already carries the COCOS-11 sign)
-    @test isequal(eq11.q1d, eq.q1d)
+    @test eq11.psi_boundary ≈ -2π
+    # q flips with σ_ρθφ (Q = −1 for 3 → 11); NaNs survive
+    @test isequal(eq11.q1d, [1.0, 1.5, NaN])
+    # …and the pair together satisfies COCOS-11's sign(q) = sign(Ip·B0):
+    # ψ now DECREASES outward, which is σ_Bp = +1 with Ip > 0
+    @test sign(eq11.psi_boundary - eq11.psi_axis) < 0
     @test eq11.F1d == eq.F1d
     @test eq11.p1d == eq.p1d
     @test eq11.axis == eq.axis && eq11.x_points == eq.x_points
@@ -104,10 +107,10 @@ end
     # b0 signed like (edge) F: attr magnitude 2.0, F<0 → −2.0
     @test eq11.b0 == -2.0
     # same-cocos no-op; unsupported targets / sources error
-    @test to_cocos(eq, 1) === eq
-    @test_throws ArgumentError to_cocos(eq, 3)
+    @test to_cocos(eq, 3) === eq
+    @test_throws ArgumentError to_cocos(eq, 1)
     @test_throws ArgumentError to_cocos(eq11, 5)   # 11 → per-radian not implemented
-    # a cocos=5-labelled field cannot convert by a pure ×2π (q would need a flip)
+    # only the native COCOS-3 label has an implemented 3 → 11 transform
     eq5 = M3DAxisymField(;
         cocos = 5, time = 0.0, R = eq.R, Z = eq.Z, psi_rz = eq.psi_rz,
         psi1d = eq.psi1d, F1d = eq.F1d, axis = eq.axis, psi_axis = 0.0,
@@ -116,7 +119,7 @@ end
     @test_throws ArgumentError to_cocos(eq5, 11)
 
     # the COCOS index is the TYPE parameter: visible in typeof, dispatchable
-    @test eq isa M3DAxisymField{1}
+    @test eq isa M3DAxisymField{3}
     @test eq11 isa M3DAxisymField{11}
     convlabel(::M3DAxisymField{11}) = :imas
     convlabel(::M3DAxisymField) = :native
@@ -125,7 +128,6 @@ end
     @test :cocos in propertynames(eq)              # eq.cocos compat accessor
     # thin re-wrap: everything except the ψ arrays is shared, not copied
     @test eq11.F1d === eq.F1d
-    @test eq11.q1d === eq.q1d
     @test eq11.x_points === eq.x_points
     @test eq11.psi1d !== eq.psi1d
     # type parameter must be an Int COCOS index

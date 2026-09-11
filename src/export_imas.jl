@@ -45,6 +45,11 @@ function assemble_ir(slices::AbstractVector, meta::NamedTuple)
     isfinite(meta.r0) && (ir["equilibrium.vacuum_toroidal_field.r0"] = meta.r0)
     isfinite(meta.b0) &&
         (ir["equilibrium.vacuum_toroidal_field.b0"] = fill(Float64(meta.b0), length(slices)))
+    # core_profiles carries its own copy of the vacuum field, so a consumer
+    # reading only that IDS still knows the B0/R0 its profiles refer to.
+    isfinite(meta.r0) && (ir["core_profiles.vacuum_toroidal_field.r0"] = meta.r0)
+    isfinite(meta.b0) &&
+        (ir["core_profiles.vacuum_toroidal_field.b0"] = fill(Float64(meta.b0), length(slices)))
 
     for (it, s) in enumerate(slices)
         i = it - 1                                   # 0-based OMAS index
@@ -55,6 +60,7 @@ function assemble_ir(slices::AbstractVector, meta::NamedTuple)
         cp = "core_profiles.profiles_1d.$i"
         ir["$cp.grid.rho_pol_norm"] = s.rho
         ir["$cp.grid.psi"] = gpsi
+        _maybe!(ir, "$cp.e_field.parallel", get(s, :epar1d, nothing))
         _maybe!(ir, "$cp.electrons.temperature", s.te)
         _maybe!(ir, "$cp.electrons.density", s.ne)
         _maybe!(ir, "$cp.ion.0.temperature", s.ti)
@@ -111,6 +117,23 @@ function assemble_ir(slices::AbstractVector, meta::NamedTuple)
         _maybe!(ir, "$ts.profiles_1d.q", get(s, :q1d, nothing))
         _maybe!(ir, "$ts.profiles_1d.phi", get(s, :phi1d, nothing))
         _maybe!(ir, "$ts.profiles_1d.f", get(s, :F1d, nothing))
+        _maybe!(ir, "$ts.profiles_1d.f_df_dpsi", get(s, :ffprime1d, nothing))
+        _maybe!(ir, "$ts.profiles_1d.dpressure_dpsi", get(s, :pprime1d, nothing))
+        _maybe!(ir, "$ts.profiles_1d.j_tor", get(s, :jtor1d, nothing))
+        # rho_tor = sqrt(Φ/(π·b0)) (IMAS DD); needs the toroidal flux and the
+        # vacuum field. Φ and b0 share a sign under COCOS 11 / :mhdsimdb (where
+        # `_cocos11_meta` signs b0 like F), but `cocos = nothing` keeps the
+        # unsigned `bzero` magnitude — so take |Φ/b0|, which is the same number
+        # whenever the signs are consistent and keeps rho_tor a length (≥0).
+        let phi = get(s, :phi1d, nothing)
+            if phi !== nothing && isfinite(meta.b0) && meta.b0 != 0
+                rt = [sqrt(abs(p / (π * meta.b0))) for p in phi]
+                if any(isfinite, rt) && (rte = last(filter(isfinite, rt))) > 0
+                    ir["$ts.profiles_1d.rho_tor"] = rt
+                    ir["$ts.profiles_1d.rho_tor_norm"] = rt ./ rte
+                end
+            end
+        end
         ir["$ts.profiles_2d.0.grid.dim1"] = s.Rg
         ir["$ts.profiles_2d.0.grid.dim2"] = s.Zg
         ir["$ts.profiles_2d.0.grid_type.index"] = 1
@@ -125,6 +148,13 @@ function assemble_ir(slices::AbstractVector, meta::NamedTuple)
         ir["$ts.global_quantities.magnetic_axis.r"] = Float64(s.R_axis)
         ir["$ts.global_quantities.magnetic_axis.z"] = Float64(s.Z_axis)
         ip_trace === nothing || (ir["$ts.global_quantities.ip"] = Float64(ip_trace[it]))
+        let b = get(s, :lcfs_rz, nothing)
+            if b !== nothing
+                ir["$ts.boundary.outline.r"] = b.R
+                ir["$ts.boundary.outline.z"] = b.Z
+                ir["$ts.boundary.psi"] = Float64(s.psi_boundary)
+            end
+        end
         # recomputed X-points (find_lcfs saddles) → boundary IDS
         for (k, xp) in enumerate(get(s, :x_points, NTuple{2, Float64}[]))
             ir["$ts.boundary.x_point.$(k - 1).r"] = xp[1]
@@ -147,6 +177,11 @@ function assemble_ir(slices::AbstractVector, meta::NamedTuple)
     # power_ohm = Ip·V_loop, the product of the traces with raw M3D-C1 signs.
     have_prad = any(s -> get(s, :prad1d, nothing) !== nothing, slices)
     vloop = gval(:v_loop);  prad_tot = gval(:power_radiated)
+    # power_ohm stays Ip·V_loop from M3D-C1's own traces. NOTE it is identically
+    # zero on every run in this database: their `loop_voltage` scalar is never
+    # written (they are current-controlled, `i_control`), so this trace only
+    # LOOKS like data. The usable ohmic information is the per-slice
+    # NOTE it is identically zero on every run in this database.
     p_ohm = (ip_trace !== nothing && vloop !== nothing) ? ip_trace .* vloop : nothing
     if have_prad || prad_tot !== nothing || p_ohm !== nothing
         _ids_props!(ir, "disruption", meta, times)
@@ -210,13 +245,15 @@ end
 const _FIELD_QTY = (
     te = :temperature, ne = :density, ti = :temperature,
     den = :density, P = :pressure,
+    E_par = :electric_field,
 )
 
 """
     reduce_axisym_slice(fields, ep, nplanes, norm, psi_axis_plane1, psi_lcfs_plane1,
                   xmag, zmag, time_s, Rg_n, Zg_n, id_map;
                   nbins=128, adj=:linear, fsa_method=:bin, fsa_window=4.0, kprad_z=-1,
-                  weighted=true, axis_aug=true, sigma_cells=1.5, ntrunc=2.0,
+                  lcfs_ntheta=257, weighted=true, axis_aug=true,
+                  sigma_cells=1.5, ntrunc=2.0,
                   xnull=NaN, znull=NaN, xnull2=NaN, znull2=NaN,
                   xlim=NaN, zlim=NaN, xlim2=NaN, zlim2=NaN, wall_rz=nothing)
 
@@ -237,6 +274,10 @@ their sum (→ `prad1d`, W/m³). Grids `Rg_n,Zg_n` are in mesh (normalized)
 units; outputs are SI. Returns the per-slice result NamedTuple (including the
 recomputed SI `x_points`).
 
+`lcfs_ntheta` sets the angular resolution of the `lcfs_rz` boundary outline
+([`trace_lcfs`](@ref)); the cost is ~0.2 s/slice at the default 257 on an 11k-
+element mesh, and X-points are snapped in exactly regardless of the resolution.
+
 Every 1D reduction is a physical flux-surface average: samples carry the
 toroidal volume measure `cell_area · R` as quadrature weight (`weighted=false`
 reverts to the plain unweighted bin mean — and disables `q1d`, whose V′ needs
@@ -249,13 +290,22 @@ for built-in smoothing with `sigma_cells`/`ntrunc`); see
 [`reduce_1d_psi_func`](@ref).
 
 `fsa_method` selects the estimator for the ratio-type profiles (`te, ne, ti, ni,
-pressure, babs1d, deltab1d`, impurity densities): `:bin` (default) is the
+pressure, babs1d, deltab1d`, impurity densities, radiated power): `:bin` (default) is the
 per-bin kernel average above; `:cumulative` computes the smoother
 `⟨f⟩(ψ)=W′(ψ)/V′(ψ)` from cumulative volume integrals (`_fsa_cumulative`, the
 same integrate-then-differentiate approach that de-noises `q1d`) — it replaces
 the per-bin shot noise (∝1/√samples-per-bin) with the lower density-estimation
-floor, and ignores `adj`/`weighted` (it is inherently volume-weighted). `F1d`,
-`q1d`, `phi1d` are already cumulative and unaffected. `fsa_window` (default 4)
+floor, and ignores `adj`/`weighted` (it is inherently volume-weighted). It also
+covers `jtor1d`, whose two reductions (⟨jφ/R⟩ and ⟨1/R⟩) are ordinary surface
+averages of fields that genuinely vary *on* a surface. It does **not** apply to
+`F1d` / `q1d` / `phi1d` / `ffprime1d` / `pprime1d`, which are pinned to `:bin`:
+`q1d`/`phi1d` are already cumulative by construction, and the others are smooth
+flux functions (or ψ-derivatives of them) whose surface average is exact, so
+there is no shot noise for the regression window to trade against — it can only
+bias them. Measured on the JET SPI slice 0, `:cumulative` puts F ~2e-3 off near
+the axis (vs 3e-5 for `:bin`) and the bias *grows* with grid refinement instead
+of converging away, which in turn breaks the `f` ↔ `f_df_dpsi` consistency by
+50×. `fsa_window` (default 4)
 sets the local-regression window width (∝ grid cells) for `:cumulative` only:
 **smaller preserves sharp edge features (e.g. a pedestal) at the cost of a little
 more noise; larger smooths harder.** The default was tuned against the
@@ -279,7 +329,7 @@ the stored plane-1 `psi_axis_plane1` / `psi_lcfs_plane1` flow through as fallbac
         Rg_n::AbstractVector, Zg_n::AbstractVector,
         id_map::AbstractMatrix{<:Integer};
         nbins::Integer = 128, adj::Symbol = :linear, fsa_method::Symbol = :bin,
-        fsa_window::Real = 4.0, kprad_z::Integer = -1,
+        fsa_window::Real = 4.0, kprad_z::Integer = -1, lcfs_ntheta::Integer = 257,
         weighted::Bool = true, axis_aug::Bool = true,
         sigma_cells::Real = 1.5, ntrunc::Real = 2.0,
         xnull::Real = NaN, znull::Real = NaN,
@@ -366,14 +416,17 @@ the stored plane-1 `psi_axis_plane1` / `psi_lcfs_plane1` flow through as fallbac
     # axis-cell augmentation: a finer sampling patch around the recomputed axis
     # feeds extra (ρ, value, weight) samples into every reduction, filling the
     # innermost ρ bins on coarse grids. Only when the axis solve succeeded.
-    Ra = Za = nothing;  ida = nothing
+    Ra = Za = nothing;  ida = nothing;  pga = nothing
     ρ_a = Float64[];  amask = Bool[];  w_a = Float64[]
     if axis_aug && lc !== nothing
         δ = 0.12 * (maximum(Rg_n) - minimum(Rg_n));  na = 50
         Ra = collect(range(R_ax - δ, R_ax + δ; length = na))
         Za = collect(range(Z_ax - δ, Z_ax + δ; length = na))
         ida = build_grid_to_element_map(Ra, Za, ep)
-        ψ_a = vec(interpolate_axisym_to_grid(psi_axisym_coef, ep, Ra, Za; id_map = ida))
+        # ψ AND ∇ψ on the patch in one pass: ψ sets the patch ρ coordinate,
+        # ∇ψ feeds ⟨|B|⟩ and the ψ-derivative profiles below.
+        pga = interpolate_axisym_gradient_to_grid(psi_axisym_coef, ep, Ra, Za; id_map = ida)
+        ψ_a = vec(pga.val)
         ρ_a = psi_n_to_rho_pol.(psi_to_psi_norm.(ψ_a, ψ0, ψ1))
         amask = isfinite.(ρ_a) .& (ρ_a .< 0.2)
         dA_a = (Ra[2] - Ra[1]) * (Za[2] - Za[1])
@@ -411,7 +464,15 @@ the stored plane-1 `psi_axis_plane1` / `psi_lcfs_plane1` flow through as fallbac
     # the value vector as NaN so reduce_1d_psi_func does the single finite filter;
     # the value vector `vv` is a per-field temporary drawn from the pool (rewound
     # at the block's return — no early return inside, so `@with_pool` is safe).
-    function reduce_raw(vgrid, vpatch)
+    #
+    # `method` overrides `fsa_method` for the quantities where the `:cumulative`
+    # smoothing is inappropriate: it exists to de-noise *ratio* profiles whose
+    # per-bin estimate is shot-noise-limited (ne/Te/δB/B), and it pays for that
+    # with a regression window. F(ψ) and the ψ-derivatives are smooth flux
+    # functions with no shot-noise problem, so the window only biases them (F
+    # measured 2e-3 off near the axis under `:cumulative` vs 3e-5 under `:bin`,
+    # and the bias grows with grid refinement instead of converging away).
+    function reduce_raw(vgrid, vpatch; method::Symbol = fsa_method)
         vgrid === nothing && return nothing
         vgv = vec(vgrid)
         ng = length(vgv)
@@ -439,7 +500,7 @@ the stored plane-1 `psi_axis_plane1` / `psi_lcfs_plane1` flow through as fallbac
             end
             if cnt < 2
                 nothing
-            elseif fsa_method === :cumulative
+            elseif method === :cumulative
                 # smooth W′/V′ estimator (inherently volume-weighted; ignores adj).
                 # fsa_window sets the regression window (∝ grid cells) — smaller
                 # preserves edge pedestals, larger smooths more (see _vprime_cumvol).
@@ -492,9 +553,12 @@ the stored plane-1 `psi_axis_plane1` / `psi_lcfs_plane1` flow through as fallbac
     # test_equilibrium_imas.jl; median q_imas/(2π·q) within 1%). The ρ=1 node
     # stays NaN (q diverges at the separatrix).
     F1d = nothing;  q1d = nothing;  phi1d = nothing
-    rI = reduce_raw(field_rz(:I), field_patch(:I))
+    rI = reduce_raw(field_rz(:I), field_patch(:I); method = :bin)
     if rI !== nothing
         F1d = rI.func_bin .* (ulen * unit_factor(norm, :magnetic_field; system = :si))
+        # the innermost ρ bin can be empty on a coarse grid (the shell has no
+        # samples) — rebuild only those nodes, never overwrite a finite F
+        _fill_axis_band!(F1d, ρgrid .^ 2; only_nonfinite = true)
         if weighted   # U′ needs the volume measure
             Δψ_si = (ψ1 - ψ0) * uflux
             cm = conf .& isfinite.(ψn) .& (ψn .>= 0.0) .& (ψn .<= 1.0)
@@ -522,6 +586,129 @@ the stored plane-1 `psi_axis_plane1` / `psi_lcfs_plane1` flow through as fallbac
         end
     end
 
+    # ψ-derivatives of the flux functions F and p → IMAS `f_df_dpsi` [T²m²/Wb]
+    # and `dpressure_dpsi` [Pa/Wb]. Differentiating the *binned* `F1d`/`pressure`
+    # would be far worse: the ρ_pol-uniform grid makes Δψ ∝ ρ² collapse toward
+    # the axis, so any binning residual is amplified by 1/Δψ (measured 12% of
+    # the FF′ scale over the whole profile, 18–24% inside ψ_N < 0.2). Instead
+    # the derivative is taken *before* the average — exactly and pointwise, from
+    # the FEM representation: for a flux function f(ψ),
+    #     df/dψ = ∇f·∇ψ / |∇ψ|²   ⇒   FF′ = I·(∇I·∇ψ)/|∇ψ|²,  p′ = (∇p·∇ψ)/|∇ψ|²
+    # which are ordinary 2D scalar fields that then go through the *same* FSA
+    # binning as every other profile (mask, axis patch, volume weights and all).
+    # The ∇-pair cancels the length normalization, so the SI factor is just the
+    # quantity's own unit ratio. Pinned to `:bin` for the reason in `reduce_raw`.
+    #
+    # Validated against the run's own EFIT input (JET SPI slice 0): 0.021% of
+    # the ffprim scale over ψ_N 0.2–0.98 at ngrid = 200 (0.007% at 400), 0.036%
+    # over the whole profile after `_fill_axis_band!`. Integrating FF′ back
+    # recovers `F1d` to 8.7e-6 relative — the exported pair is self-consistent
+    # to better than its own accuracy (which needs `F1d` on `:bin`, see above).
+    #
+    # The p / `dpressure_dpsi` pair does NOT close that tightly, and the gap is
+    # mostly physics rather than numerics. `pressure` is a ratio profile (so it
+    # follows `fsa_method`, `:cumulative` in the production scripts) while `p′`
+    # is pinned to `:bin`; on the JET SPI t=0 slice, where p is still an exact
+    # flux function, matching the estimators takes the closure from 4.0e-3 to
+    # 4.1e-4. Later in the run it stays ~2-3e-3 under either estimator, because
+    # p has stopped being a flux function: measured on that run, p varies 7% on
+    # the ψ_N = 0.8 surface by t = 1.4 ms and 18% by t = 2.5 ms, tracking the
+    # pellet inward, while F stays a flux function to <0.03% throughout. So
+    # `f_df_dpsi` is exact at every slice, and `dpressure_dpsi` is a best-fit
+    # flux function once the cooling front has passed a given surface.
+    ffprime1d = nothing;  pprime1d = nothing
+    let g2 = pg.dR .^ 2 .+ pg.dZ .^ 2
+        gmax = 0.0
+        @inbounds for v in g2
+            (isfinite(v) && v > gmax) && (gmax = v)
+        end
+        g2a = pga === nothing ? nothing : (pga.dR .^ 2 .+ pga.dZ .^ 2)
+        gfloor = _GRAD_PSI_FLOOR * gmax
+        ψN_nodes = ρgrid .^ 2
+        # FSA of df/dψ (× f when `times_f`), from the exact FEM ∇f and ∇ψ
+        function dpsi_prof(key::Symbol, ufac::Real; times_f::Bool = false)
+            c = (gmax > 0) ? field_axisym(key) : nothing
+            c === nothing && return nothing
+            fg = interpolate_axisym_gradient_to_grid(c, ep, Rg_n, Zg_n; id_map = id_map)
+            vg = fill(NaN, size(g2))
+            @inbounds for i in eachindex(g2)
+                g2[i] > gfloor || continue
+                vg[i] = (times_f ? fg.val[i] : 1.0) *
+                    (fg.dR[i] * pg.dR[i] + fg.dZ[i] * pg.dZ[i]) / g2[i]
+            end
+            vp = nothing
+            if g2a !== nothing
+                fa = interpolate_axisym_gradient_to_grid(c, ep, Ra, Za; id_map = ida)
+                vp = fill(NaN, length(g2a))
+                @inbounds for i in eachindex(vp)
+                    g2a[i] > gfloor || continue
+                    vp[i] = (times_f ? fa.val[i] : 1.0) *
+                        (fa.dR[i] * pga.dR[i] + fa.dZ[i] * pga.dZ[i]) / g2a[i]
+                end
+            end
+            r = reduce_raw(vg, vp; method = :bin)
+            r === nothing && return nothing
+            return _fill_axis_band!(r.func_bin .* ufac, ψN_nodes)
+        end
+        ub_si = unit_factor(norm, :magnetic_field; system = :si)
+        ffprime1d = dpsi_prof(:I, (ulen * ub_si)^2 / uflux; times_f = true)
+        pprime1d = dpsi_prof(:P, unit_factor(norm, :pressure; system = :si) / uflux)
+    end
+
+    # toroidal current density (needs :jphi).
+    #
+    # **M3D-C1's `jphi` output field is NOT a current density: it is +Δ*ψ, i.e.
+    # −μ₀·R·J_φ.** The HDF5 write (`output.f90:1307`) takes `jphi_field`, which
+    # `newpar.f90:844` solves as M⁻¹·G·ψ against `NV_GS_MATRIX`, and
+    # `newvar.f90:239` makes that matrix `intxx2(mu(OP_1), nu(OP_GS))` with
+    # `OP_GS = ∂_RR + ∂_ZZ − (1/R)∂_R` (`m3dc1_nint.f90:302`) — a pure L2
+    # projection of Δ*ψ, no R weighting and no sign. Ampère in M3D-C1's own
+    # representation is μ₀J_φ = −Δ*ψ/R (`doc/numerical_methods.tex:26-28`;
+    # `model.f90:514` "no toroidal current = -Delta*(psi)/R"), so jφ = −jphi/R
+    # in mesh units. The NEGATION below is that minus sign.
+    #
+    # The old code took jφ = +jphi/R on the strength of
+    # `∫(jphi/R)dA = 2.41250 MA = |toroidal_current|` — an ABSOLUTE-value check,
+    # structurally incapable of catching the inversion. Cross-checked two ways
+    # after the fix: the curl of the exported B gives J_φ(axis) = −1.4229e6 A/m²,
+    # and the Grad–Shafranov source R·p′ + F·F′/(μ₀R) gives −1.4166e6 (0.4%).
+    # This is a plain bug fix, independent of COCOS, so it applies on every
+    # output path including `cocos = nothing` and `:mhdsimdb`.
+    #
+    # IMAS defines profiles_1d.j_tor as ⟨jφ/R⟩/⟨1/R⟩ (not the plain FSA), so it
+    # is assembled from two reductions sharing the mask/patch/weights; the R
+    # normalization cancels in the ratio, leaving a pure `:current_density`
+    # conversion.
+    jtor1d = nothing
+    let jphi_rz = field_rz(:jphi)
+        if jphi_rz !== nothing
+            nRg = length(Rg_n);  nZg = length(Zg_n)
+            jn = [jphi_rz[i, j] / Float64(Rg_n[i])^2 for i in 1:nRg, j in 1:nZg]  # jφ/R
+            inv_r = [1.0 / Float64(Rg_n[i]) for i in 1:nRg, j in 1:nZg]           # 1/R
+            jp = field_patch(:jphi)
+            jn_p = inv_r_p = nothing
+            if Ra !== nothing && jp !== nothing
+                na = length(Ra)
+                Rcol = vec([Float64(Ra[i]) for i in 1:na, _ in 1:na])
+                jn_p = jp ./ Rcol .^ 2
+                inv_r_p = 1.0 ./ Rcol
+            end
+            rj = reduce_raw(jn, jn_p)
+            ri = reduce_raw(inv_r, inv_r_p)
+            if rj !== nothing && ri !== nothing
+                # −1: jphi = +Δ*ψ = −μ₀R·J_φ (see above)
+                ujd = -unit_factor(norm, :current_density; system = :si)
+                jtor1d = [
+                    (isfinite(a) && isfinite(b) && b != 0) ? a / b * ujd : NaN
+                        for (a, b) in zip(rj.func_bin, ri.func_bin)
+                ]
+                # under `:bin` the innermost ρ shell can hold no samples at all
+                # (same empty-bin case `F1d` hits) — rebuild only those nodes
+                _fill_axis_band!(jtor1d, ρgrid .^ 2; only_nonfinite = true)
+            end
+        end
+    end
+
     # axisymmetric B components (needs :I): B = ∇ψ×∇φ + I∇φ with per-radian ψ,
     # so B_R = −ψ_Z/R, B_Z = +ψ_R/R, Bφ = I/R (M3D-C1 m3dc1_nint.f90:1172 uses
     # exactly |B|² = (ψ_R²+ψ_Z²+I²)/R²). ⟨|B|⟩ is a plain weighted FSA (ratio —
@@ -536,8 +723,7 @@ the stored plane-1 `psi_axis_plane1` / `psi_lcfs_plane1` flow through as fallbac
         bphi_n = [ I_rz[i, j] / Float64(Rg_n[i]) for i in 1:nRg, j in 1:nZg]
         babs_n = sqrt.(br_n .^ 2 .+ bz_n .^ 2 .+ bphi_n .^ 2)
         babs_patch = nothing
-        if Ra !== nothing
-            pga = interpolate_axisym_gradient_to_grid(psi_axisym_coef, ep, Ra, Za; id_map = ida)
+        if pga !== nothing
             Ia = field_patch(:I)
             if Ia !== nothing
                 na = length(Ra)
@@ -552,6 +738,22 @@ the stored plane-1 `psi_axis_plane1` / `psi_lcfs_plane1` flow through as fallbac
         babs1d = rB === nothing ? nothing : rB.func_bin .* ub
         br_rz = br_n .* ub;  bz_rz = bz_n .* ub;  bphi_rz = bphi_n .* ub
     end
+
+    # ── E∥, ⟨J·B⟩, σ∥, Zeff, ohmic power ─────────────────────────────────────
+    # All are ordinary surface averages of fields that genuinely vary ON a flux
+    # surface, so (unlike F/FF′/p′) they follow `fsa_method` like te/ne.
+    #
+    # `E_par` is M3D-C1's own E·B/|B|. Cross-check on the JET SPI slice 0: at the
+    # axis B is essentially pure toroidal with Bφ = F/R < 0, so E∥ must equal
+    # −E_φ — measured +0.17965 vs −0.17956 V/m (0.05%), which validates the
+    # :electric_field unit factor independently of this path. Note E_φ itself is
+    # NOT usable as a flux-surface quantity: it mixes the inductive and v×B
+    # parts, which nearly cancel, so R·E_φ (a flux function in ideal MHD) was
+    # measured to vary 4–10% poloidally already at t=0 and >100% later, while
+    # E∥ stays smooth and physical throughout.
+    epar1d = prof(:E_par)
+
+
 
     # δB/B: plane-sampled toroidal-fluctuation map (needs :I; f′ = ∂f/∂φ
     # carries the non-axisymmetric part of B — see docs/deltab_over_b.md and
@@ -599,10 +801,38 @@ the stored plane-1 `psi_axis_plane1` / `psi_lcfs_plane1` flow through as fallbac
 
     # recomputed X-points (SI), for downstream consumers (boundary IDS, masks)
     x_points = NTuple{2, Float64}[]
+    x_mesh = NTuple{2, Float64}[]                # same points, mesh units
     if lc !== nothing
         for x in (lc.x1, lc.x2)
-            (x !== nothing && x.converged && x.kind === :saddle) &&
-                push!(x_points, (x.R * ulen, x.Z * ulen))
+            (x !== nothing && x.converged && x.kind === :saddle) || continue
+            push!(x_points, (x.R * ulen, x.Z * ulen))
+            push!(x_mesh, (Float64(x.R), Float64(x.Z)))
+        end
+    end
+
+    # LCFS outline → equilibrium…boundary.outline. Traced on the exact FEM ψ by
+    # [`trace_lcfs`](@ref) (rays from the axis, not a contour of `psi_rz`), so
+    # it is independent of `ngrid` and needs no private-flux masking. Validated
+    # against the run's own EFIT boundary on JET SPI slice 0: mean radial
+    # deviation 1.0 mm = 0.09% of the minor radius (DIII-D 0.05%, KSTAR 0.20%).
+    # `nothing` on the degenerate slices where ψ_axis == ψ_boundary (the plasma
+    # is gone) — those already carry no `q1d` either.
+    lcfs_rz = nothing
+    if lc !== nothing && isfinite(ψ1 - ψ0) && ψ1 != ψ0
+        tr = try
+            trace_lcfs(
+                psi_axisym_coef, ep, (R_ax, Z_ax), ψ0, ψ1;
+                ntheta = lcfs_ntheta, x_points = x_mesh,
+                id_map = id_map, R_grid = Rg_n, Z_grid = Zg_n
+            )
+        catch err
+            @warn "reduce_axisym_slice: LCFS outline trace failed; boundary.outline omitted" exception = err
+            nothing
+        end
+        if tr !== nothing
+            tr.nmiss == 0 ||
+                @warn "reduce_axisym_slice: LCFS outline has $(tr.nmiss)/$(lcfs_ntheta - 1) unresolved angles (rays left the mesh); outline chords across the gaps"
+            lcfs_rz = (; R = tr.R .* ulen, Z = tr.Z .* ulen)
         end
     end
 
@@ -613,7 +843,9 @@ the stored plane-1 `psi_axis_plane1` / `psi_lcfs_plane1` flow through as fallbac
         ni = prof(:den), pressure = prof(:P),
         imp_dens = imp_dens, prad1d = prad1d,
         F1d = F1d, q1d = q1d, phi1d = phi1d, babs1d = babs1d,
-        deltab1d = deltab1d,
+        jtor1d = jtor1d, ffprime1d = ffprime1d, pprime1d = pprime1d,
+        epar1d = epar1d,
+        deltab1d = deltab1d, lcfs_rz = lcfs_rz,
         psi_rz = Array{Float64}(psi_rz) .* uflux,
         br_rz = br_rz, bz_rz = bz_rz, bphi_rz = bphi_rz, phi_rz = phi_rz,
         Rg = collect(Float64, Rg_n) .* ulen, Zg = collect(Float64, Zg_n) .* ulen,
@@ -621,6 +853,50 @@ the stored plane-1 `psi_axis_plane1` / `psi_lcfs_plane1` flow through as fallbac
         R_axis = R_ax * ulen, Z_axis = Z_ax * ulen,
         x_points = x_points,
     )
+end
+
+# ψ-derivative FSA tuning. `_GRAD_PSI_FLOOR` drops the |∇ψ|→0 neighbourhood of
+# the magnetic axis, where df/dψ = ∇f·∇ψ/|∇ψ|² is numerically 0/0 (threshold is
+# relative to the slice's own max |∇ψ|², so it scales with the equilibrium).
+# `_AXIS_FILL_*` then rebuild the innermost nodes from the well-resolved band.
+const _GRAD_PSI_FLOOR = 1.0e-6
+const _AXIS_FILL_LO = 0.01
+const _AXIS_FILL_BAND = (0.01, 0.30)
+
+# Rebuild the innermost ψ_N nodes of a ψ-derivative profile from a polynomial
+# fit of the well-resolved band. Two effects need this: the axis node is 0/0
+# (see `_GRAD_PSI_FLOOR`), and the binning kernel is one-sided at ρ→0 (no ρ<0
+# samples) with a volume weight ∝ρ, so the axis-adjacent nodes are biased
+# outward. The bias is an estimator edge effect, not a discretization error —
+# measured at 0.6% of the FF′ scale at ρ=0, decaying to zero by ψ_N ≈ 0.005,
+# and *identical* at ngrid 200 and 400. A cubic extrapolation over the
+# innermost 1% removes it (FF′ rms over ψ_N<0.02: 0.55% → 0.083%; over the
+# whole profile 0.118% → 0.036%, vs the run's own EFIT input). Note the EFIT
+# reference is itself unreliable at that node — its ffprim is an extrapolation
+# of the fit basis, e.g. 2.518 next to 2.064 one node in on the KSTAR case,
+# where the extrapolated value here continues the smooth trend instead.
+function _fill_axis_band!(
+        v::Vector{Float64}, psin::AbstractVector,
+        lo::Real = _AXIS_FILL_LO, band::Tuple{<:Real, <:Real} = _AXIS_FILL_BAND;
+        deg::Integer = 3, only_nonfinite::Bool = false
+    )
+    tgt = [k for k in eachindex(v) if psin[k] < lo && (!only_nonfinite || !isfinite(v[k]))]
+    isempty(tgt) && return v
+    idx = [k for k in eachindex(v) if band[1] <= psin[k] <= band[2] && isfinite(v[k])]
+    length(idx) >= deg + 2 || return v          # too sparse to extrapolate safely
+    x = Float64[psin[k] for k in idx]
+    A = [x[i]^(j - 1) for i in eachindex(x), j in 1:(deg + 1)]
+    c = try
+        A \ v[idx]
+    catch err
+        @debug "_fill_axis_band!: fit failed; leaving the axis nodes as-is" exception = err
+        return v
+    end
+    all(isfinite, c) || return v
+    @inbounds for k in tgt
+        v[k] = sum(c[j] * psin[k]^(j - 1) for j in 1:(deg + 1))
+    end
+    return v
 end
 
 # V′(ψ) at the ρ nodes from the exact cumulative confined volume: per-bin
@@ -702,7 +978,7 @@ function _fsa_cumulative(
     return (; psi_grid = collect(Float64, ρgrid), func_bin, den = Vp)
 end
 
-const _OPT_FIELDS = (:te, :ne, :ti, :den, :P)
+const _OPT_FIELDS = (:te, :ne, :ti, :den, :P, :E_par)
 
 # Coefficient-row range per field: everything is evaluated at a plane (ζ=0, rows
 # 1:20); the sole exception is legacy `f`, whose ∂/∂φ (δB/B) needs rows 21:40 →
@@ -723,26 +999,67 @@ function _try_field(file, ts, fld; rows = 1:20)
     end
 end
 
-# COCOS-11 conversion of one per-slice result: ψ-like quantities ×2π, nothing
-# else. This is sign-flip-free by construction: the n=0 data satisfies
-# B = +∇ψ×∇φ + F∇φ (fusion-io m3dc1_fortran.cpp convention, same as our
-# assembler), so the ψ orientation is Ampère-consistent with the field-frame
-# Ip for either current direction, and the raw identity q = dΦ/(2π dψ) already
-# carries the COCOS-11 sign(q) = sign(Ip·B0). F/Φ/B/p are frame quantities.
-_to_cocos11_slice(s::NamedTuple) =
-    merge(
-    s, (;
-        psi1d = s.psi1d .* 2π, psi_rz = s.psi_rz .* 2π,
-        psi_axis = s.psi_axis * 2π, psi_boundary = s.psi_boundary * 2π,
+# COCOS 3 → COCOS 11 conversion of one per-slice result.
+#
+# **M3D-C1's native data is COCOS 3, not COCOS 1.** The distinction is σ_Bp:
+# M3D-C1 writes B = +∇ψ×∇φ + F∇φ (⇒ B_R = −ψ_Z/R, B_Z = +ψ_R/R), while COCOS
+# places σ_Bp in front of the *reversed* cross product — OMAS `omas_physics.py`
+# and MXHEquilibrium `fields.jl` both spell it B_R = +σ_RφZ·σ_Bp·(∂ψ/∂Z)/((2π)^e_Bp R).
+# So M3D-C1 is σ_Bp = −1, and operationally sign(ψ_edge − ψ_axis) = −sign(Ip) on
+# every run. Confirmed three independent ways: OMAS `identify_cocos` on native
+# (b0, Ip, q, ψ) returns [4, 14, 3, 13] for JET / DIII-D / ITER cases alike; a
+# pointwise check of the *previously exported* file found its ψ map and its own
+# `b_field_r`/`b_field_z` arrays anti-parallel (median ratio −0.9998,
+# correlation −0.99999988 over 30 476 grid points); and M3D-C1's own
+# `iflip_j` ("flip equilibrium toroidal current density") is implemented as
+# `mult(psi_field(0), -1.)` — reversing Ip *is* negating ψ.
+#
+# The transform is therefore `cocos_transform(3, 11)` applied verbatim:
+#     PSI              ×(−2π)      ψ decreases outward for Ip > 0 in COCOS 11
+#     Q                ×(−1)       σ_ρθφ flips, giving sign(q) = sign(Ip·B0)
+#     F_FPRIME/PPRIME  ×(−1/2π)    one inverse power of ψ ⇒ ψ's sign and scale
+#     IP, BT, F, TOR   ×(+1)       ip, b0, F, Φ, ρ_tor are untouched
+# `pressure`, the B maps, ⟨|B|⟩, E∥ and all geometry are frame quantities or
+# invariants and do not transform. Partial fixes are invalid: flipping only q
+# lands on COCOS 7/17, flipping only ψ lands on COCOS 5/15.
+#
+# `q1d` is flipped HERE and not upstream: `phi1d` is built from `q1d` as
+# Φ = 2π∫q dψ in the native frame and must keep its native value (Φ is a TOR
+# quantity, ×(+1)). The identity survives the relabelling exactly, because ψ
+# flips with q: dΦ/dψ₁₁ = (dΦ/dψ_nat)·(−1/2π) = −q_nat = q₁₁.
+function _to_cocos11_slice(s::NamedTuple)
+    s = merge(
+        s, (;
+            psi1d = s.psi1d .* (-2π), psi_rz = s.psi_rz .* (-2π),
+            psi_axis = s.psi_axis * (-2π), psi_boundary = s.psi_boundary * (-2π),
+        )
     )
-)
+    for (k, f) in ((:ffprime1d, -2π), (:pprime1d, -2π), (:q1d, -1.0))
+        v = get(s, k, nothing)
+        v === nothing || (s = merge(s, NamedTuple{(k,)}((v ./ f,))))
+    end
+    return s
+end
+
+# One-line provenance note naming the convention a file was written in.
+_cocos_comment(cc) =
+    cc == 11 ?
+    "M3DC1Reader FSA export; COCOS-11 via cocos_transform(3,11): psi = -2pi*psi_M3DC1 [Wb], q *= -1, f_df_dpsi/dpressure_dpsi /= -2pi; ip = M3D-C1 toroidal_current unmodified; b0 signed like F" :
+    cc === :mhdsimdb ?
+    "M3DC1Reader FSA export; MHDsimDB drop-in layout (equilibrium psi per-radian = M3D-C1 native COCOS-3, sigma_Bp=-1; core_profiles/disruption grid.psi = 2pi*(psi-psi_axis) NIMROD-style; ip = toroidal_current unmodified)" :
+    "M3DC1Reader FSA export; raw M3D-C1 per-radian convention = COCOS 3 (sigma_Bp = -1), not COCOS-11"
 
 # MHDsimDB drop-in layout (deliberately NOT a single COCOS — it mirrors the
 # NIMROD-derived files, reverse-engineered in docs/cocos_conventions.md):
-# the equilibrium IDS keeps the per-radian COCOS-1 ψ (like the DB's raw-EFIT
-# equilibrium blocks), while the core_profiles/disruption grids carry the
-# NIMROD-native 2π·(ψ − ψ_axis) — total-flux scale, zero at the axis,
-# increasing with the field-frame Ip (the MGI-file orientation).
+# the equilibrium IDS keeps M3D-C1's native per-radian ψ — which is a valid,
+# self-consistent **COCOS 3** (σ_Bp = −1; its sign already agrees with the
+# `b_field_r`/`b_field_z` arrays written beside it), so it is deliberately NOT
+# given the COCOS-11 sign flips. The core_profiles/disruption grids carry the
+# NIMROD-native 2π·(ψ − ψ_axis) — total-flux scale, zero at the axis.
+# NOTE (unresolved): with σ_Bp = −1 that grid DECREASES for Ip > 0 (measured
+# 0 → −1.7445 on C1_154127). Whether the NIMROD reference files run the other
+# way has to be settled by reading one, not by argument; if so this needs
+# 2π·(ψ_axis − ψ). `rho_pol_norm` is written alongside and is unaffected.
 _to_mhdsimdb_slice(s::NamedTuple) =
     merge(s, (; grid_psi1d = 2π .* (s.psi1d .- s.psi_axis)))
 
@@ -750,7 +1067,8 @@ _to_mhdsimdb_slice(s::NamedTuple) =
     export_imas(file, out_path; slices=list_timeslices(file), nbins=128,
                 ngrid=200, adj=:linear, fsa_method=:bin, fsa_window=4.0, comment="",
                 recompute_ne=false, cocos=11, pulse=nothing,
-                ascot5=false, ascot5_nphi=0, ascot5_dir="", verbose=false) -> out_path
+                ascot5=false, ascot5_nphi=0, ascot5_dir="",
+                cocos11_path="", verbose=false) -> out_path
 
 Compute FSA 1D profiles (Te, ne, Ti, ni, pressure) + the 2D ψ map for `slices`
 and write an OMAS-compatible IMAS HDF5 file at `out_path`. When the KPRAD model
@@ -770,32 +1088,66 @@ axisymmetric export never produces them). `ascot5_nphi` sets the field toroidal
 resolution (`0` → `4·nplanes`); `ascot5_dir` sets the output directory (default:
 the IMAS output's directory, created if new — the basename stays index-based).
 
+Each `equilibrium…time_slice` carries, besides the ψ/q/pressure/Φ profiles and
+the 2D maps: `profiles_1d.f_df_dpsi` and `profiles_1d.dpressure_dpsi` (FF′ and
+p′, from the exact FEM ∇f·∇ψ/|∇ψ|² rather than a differentiated profile — see
+[`reduce_axisym_slice`](@ref)), `profiles_1d.j_tor` (the IMAS
+⟨jφ/R⟩/⟨1/R⟩, needs the `:jphi` field), `profiles_1d.rho_tor` /
+`rho_tor_norm` (√(Φ/πb0), needs `phi1d` and `vacuum_toroidal_field.b0`), and
+`boundary.outline.{r,z}` + `boundary.psi` — the LCFS traced on the FEM ψ by
+[`trace_lcfs`](@ref) (grid-independent, private-flux region excluded by
+construction). These are the paths the DREAM disruption-simulation setup reads
+(alongside `boundary.x_point`).
+
+Each `core_profiles.profiles_1d` also carries `e_field.parallel` — M3D-C1's own
+`E_par` field, which `electric_field.f90` builds as E·B/|B| from the same ψ/I
+quadrature arrays as everything else (Ohm's law there is E = +ηJ − v×B, and the
+divisor `b2` expands term-by-term to B_R²+B_Z²+B_φ² for B_R=−ψ_Z/R, B_Z=+ψ_R/R,
+B_φ=F/R). It is written with **no sign change**: dotting the stored
+(E_R,E_PHI,E_Z) with that same B reproduces the stored `E_par` to 0.3%, and
+against an Ampère-frame J it gives η = E∥/J∥ = 1.257e−7 Ω·m, matching M3D-C1's
+own ⟨1/η⟩ to 0.3%. NOT E_φ, which mixes the inductive and v×B parts that nearly
+cancel — R·E_φ was measured to vary 4–10% poloidally already at t = 0 and >100%
+later, while E∥ stays smooth. `core_profiles.vacuum_toroidal_field.{r0,b0}` is
+written alongside.
+
 When the `:I` field is present, each `equilibrium…profiles_2d.0` also gets the
 axisymmetric field maps `b_field_r/z/tor` and the toroidal-flux map `phi` [T,
 Wb per-radian], and each `core_profiles.profiles_1d` gets the FSA
 `custom.b_field_torus_average` = ⟨|B|⟩ [T] (the path the legacy fusion-io
 mapper used for this ML feature).
 
-`cocos = 11` (default) writes the file in the IMAS COCOS-11 convention: every
-ψ (1D grids, 2D map, psi_axis/psi_boundary) is the total flux 2π·ψ_M3D [Wb];
-`summary`/`equilibrium` `ip` is the **field-frame** current — flipped from
-M3D-C1's `toroidal_current` diagnostic when that disagrees with the ψ-map
-orientation (Ampère: sign(Ip) = sign(ψ_bnd−ψ_axis) for B = +∇ψ×∇φ) — and
-`vacuum_toroidal_field.b0` is signed like F. q, Φ, F, p and the B maps are
-already COCOS-11-consistent as computed (see `_to_cocos11_slice` /
-[`to_cocos`](@ref)); with these choices the file satisfies
-sign(q) = sign(Ip·B0). `cocos = nothing` keeps the raw M3D-C1 per-radian
-convention (the pre-COCOS behavior).
+`cocos = 11` (default) writes the file in the IMAS COCOS-11 convention.
+**M3D-C1's native data is COCOS 3** (σ_Bp = −1 — see `_to_cocos11_slice` for the
+evidence), so the conversion is `cocos_transform(3, 11)` applied verbatim:
+every ψ (1D grids, 2D map, psi_axis/psi_boundary, boundary.psi) becomes
+**−2π·ψ_M3D** [Wb], `q` flips sign, and the ψ-derivatives (`f_df_dpsi`,
+`dpressure_dpsi`) are divided by **−2π**. `ip` is M3D-C1's `toroidal_current`
+**unmodified** (IP is invariant under every 3→11 transform), and
+`vacuum_toroidal_field.b0` is signed like F because the `bzero` attribute is an
+unsigned magnitude. F, Φ, ρ_tor, p, E∥ and the B maps do not transform. The
+result satisfies sign(q) = sign(Ip·B0) with the *physical* Ip, and its ψ map is
+sign-consistent with the `b_field_r`/`b_field_z` arrays beside it.
+
+`cocos = nothing` keeps the raw M3D-C1 per-radian convention — which is a
+self-consistent **COCOS 3** file, not COCOS 1.
+
+`cocos11_path` (when non-empty) additionally writes the **same export** in the
+COCOS-11 convention to that second path — useful when the primary output has to
+stay in the `:mhdsimdb` drop-in layout but a consumer wants the IMAS-standard
+one. The per-slice FSA is convention-free, so the twin re-uses the same
+reduction: it costs one transform + one write, not a second pass over the
+multi-GB slice files. Returns `(out_path, twin_path)` in that case.
 
 `cocos = :mhdsimdb` mirrors the **existing NIMROD-derived MHDsimDB files** so
 the output is a drop-in row next to them (for the Python
-`disruption_database_tools` consumers): the `equilibrium` IDS stays per-radian
-COCOS-1 (like the DB's raw-EFIT equilibrium blocks) while the
-`core_profiles`/`disruption` `grid.psi` carries NIMROD-native
-2π·(ψ − ψ_axis) (total-flux scale, axis-zeroed, MGI-file orientation); ip and
-b0 get the same field-frame sign fixes as `cocos = 11`. This layout is
-deliberately **not one COCOS** — it reproduces the DB's mixed conventions
-(see `docs/cocos_conventions.md`).
+`disruption_database_tools` consumers): the `equilibrium` IDS keeps M3D-C1's
+native per-radian ψ/q/FF′/p′ (a valid COCOS 3 — no sign flips) while the
+`core_profiles`/`disruption` `grid.psi` carries NIMROD-native 2π·(ψ − ψ_axis)
+(total-flux scale, axis-zeroed); `b0` gets the same sign-from-F fix as
+`cocos = 11` and `ip` is written unmodified. This layout is deliberately
+**not one COCOS** — it reproduces the DB's mixed conventions (see
+`docs/cocos_conventions.md`).
 
 Machine-description / source IDS (all in the NIMROD-DB layout): the `wall`
 IDS carries the M3D-C1 mesh boundary as the limiter outline
@@ -844,6 +1196,7 @@ function export_imas(
         pulse::Union{Nothing, Integer} = nothing,
         ascot5::Bool = false, ascot5_nphi::Integer = 0,
         ascot5_dir::AbstractString = "",
+        cocos11_path::AbstractString = "",
         verbose::Bool = false
     )
     cocos === nothing || cocos == 11 || cocos === :mhdsimdb ||
@@ -853,6 +1206,10 @@ function export_imas(
                 "or nothing (raw M3D-C1 per-radian), got $cocos"
         )
     )
+    # validated up front: the slice loop below is the multi-GB read, and an
+    # argument error must not cost it (nor leave a half-finished primary file)
+    (!isempty(cocos11_path) && cocos == 11) &&
+        throw(ArgumentError("cocos11_path is redundant when cocos = 11 (that IS the output)"))
     norm = normalization(file)
     ep = elems_plane(file)
     Rg_n = collect(range(extrema(ep[5, :])..., length = ngrid))
@@ -875,7 +1232,7 @@ function export_imas(
     # into persistent buffers reused every slice — the ~28-MiB coefficient
     # matrices are allocated once, not per slice (see read_timeslice!).
     ffield = fprime ? :fp : :f
-    opt_flds = (_OPT_FIELDS..., :I, ffield, kfields...)
+    opt_flds = (_OPT_FIELDS..., :I, :jphi, ffield, kfields...)
     fbuf = Dict{Symbol, Matrix{Float64}}()   # reused Float64 field buffers (= sl.fields)
     sbuf = Dict{Symbol, Matrix{Float32}}()   # reused Float32 hyperslab staging
     results = NamedTuple[]
@@ -955,12 +1312,7 @@ function export_imas(
     end
     verbose && @info "export_imas: $nsl slices done in $(_fmt_dur(time() - t_start)); writing $(basename(String(out_path)))…"
 
-    cmt = !isempty(comment) ? comment :
-        cocos == 11 ?
-        "M3DC1Reader FSA export; COCOS-11 (psi = total flux [Wb], field-frame ip, sign(q)=sign(ip*b0))" :
-        cocos === :mhdsimdb ?
-        "M3DC1Reader FSA export; MHDsimDB drop-in layout (equilibrium psi per-radian COCOS-1; core_profiles/disruption grid.psi = 2pi*(psi-psi_axis) NIMROD-style; field-frame ip)" :
-        "M3DC1Reader FSA export; psi in M3D-C1 per-radian convention (not COCOS-11)"
+    cmt = isempty(comment) ? _cocos_comment(cocos) : comment
     imp_label, imp_a = _impurity_species(kprad_z)
     meta = (;
         source = "M3D-C1", provider = "M3DC1Reader.jl", code_name = "M3DC1Reader",
@@ -972,28 +1324,41 @@ function export_imas(
     # vacuum field constants if present on the file root (best-effort; NaN otherwise)
     meta = _with_vacuum_field(file, norm, meta)
 
-    if cocos == 11
-        results = NamedTuple[_to_cocos11_slice(s) for s in results]
-        meta = _cocos11_meta(meta, results)
-    elseif cocos === :mhdsimdb
-        results = NamedTuple[_to_mhdsimdb_slice(s) for s in results]
-        meta = _cocos11_meta(meta, results)     # same field-frame ip / signed-b0 fixes
+    # The per-slice FSA (`results`) is convention-free — a convention is only a
+    # relabelling applied on the way out. So each requested output re-uses the
+    # SAME reduction: the second file costs a transform + a write, not a re-read
+    # of the multi-GB slice files.
+    mesh_zone_f = _try_field(file, first(slices), :mesh_zone; rows = 1:1)
+    function _write_variant(cc, path)
+        res = cc == 11 ? NamedTuple[_to_cocos11_slice(s) for s in results] :
+            cc === :mhdsimdb ? NamedTuple[_to_mhdsimdb_slice(s) for s in results] :
+            results
+        # field-frame ip / signed-b0 fixes apply to both labelled conventions
+        m = (cc === nothing) ? meta : _cocos11_meta(meta, res)
+        # the primary keeps an explicit user comment verbatim; the twin gets the
+        # convention appended, so a COCOS-11 file is never labelled as if it were
+        # the (differently-scaled) primary
+        m = merge(
+            m, (;
+                comment = isempty(comment) ? _cocos_comment(cc) :
+                    cc == cocos ? comment : comment * " | " * _cocos_comment(cc),
+            )
+        )
+        ir = assemble_ir(res, m)
+        # machine-description / source IDS (static or trace-driven, not per-slice FSA)
+        ts_times = Float64[s.time for s in res]
+        isempty(ts_times) || _wall_ir!(ir, ep, norm, ts_times[1], mesh_zone_f)
+        _pellets_ir!(ir, file, norm, nsteps, ts_times, m)
+        pulse === nothing || (ir["dataset_description.data_entry.pulse"] = Int(pulse))
+        return write_omas_h5(path, ir)
     end
 
-    ir = assemble_ir(results, meta)
-
-    # machine-description / source IDS (static or trace-driven, not per-slice FSA)
-    ts_times = Float64[s.time for s in results]
-    isempty(ts_times) || _wall_ir!(
-        ir, ep, norm, ts_times[1],
-        _try_field(file, first(slices), :mesh_zone; rows = 1:1)
-    )
-    _pellets_ir!(ir, file, norm, nsteps, ts_times, meta)
-    pulse === nothing || (ir["dataset_description.data_entry.pulse"] = Int(pulse))
-
-    written = write_omas_h5(out_path, ir)
-    verbose && @info "export_imas: done — $nsl slices in $(_fmt_dur(time() - t_start)) → $written"
-    return written
+    written = _write_variant(cocos, out_path)
+    extra = String[]
+    isempty(cocos11_path) || push!(extra, _write_variant(11, cocos11_path))
+    verbose && @info "export_imas: done — $nsl slices in $(_fmt_dur(time() - t_start)) → $written" *
+        (isempty(extra) ? "" : " (+ COCOS-11 twin: $(join(extra, ", ")))")
+    return isempty(extra) ? written : (written, extra...)
 end
 
 # wall IDS: the M3D-C1 computational mesh boundary as the limiter outline
@@ -1145,37 +1510,31 @@ function _pellets_ir!(
     return nothing
 end
 
-# Field-frame sign fixes for the COCOS-11 export: flip the `toroidal_current`
-# trace when its sign disagrees with the ψ-map orientation (Ampère with
-# B = +∇ψ×∇φ: sign(Ip) = sign(ψ_bnd−ψ_axis); M3D-C1's totcur diagnostic uses
-# the opposite convention), and sign `vacuum_toroidal_field.b0` like F (the
-# `bzero` attribute is an unsigned magnitude).
+# Sign fix for the labelled conventions: `vacuum_toroidal_field.b0` is signed
+# like F, because M3D-C1's `bzero` attribute is an unsigned magnitude.
+#
+# `ip` is written UNMODIFIED. It used to be flipped whenever
+# sign(ip) != sign(ψ_bnd − ψ_axis), on the premise that M3D-C1 is σ_Bp = +1 and
+# its `toroidal_current` diagnostic was the odd one out. That premise was wrong
+# in both halves and the flip was a structural bug — see `_to_cocos11_slice`.
+# Briefly: M3D-C1's B = +∇ψ×∇φ + F∇φ puts the sign in front of ∇ψ×∇φ, whereas
+# COCOS puts σ_Bp in front of ∇φ×∇ψ (OMAS `omas_physics.py`; MXHEquilibrium
+# `fields.jl`), so M3D-C1 is σ_Bp = **−1**. The flip condition is then σ_Bp
+# itself — true on *every* M3D-C1 run — and flipping ip reverses sign(Ip·B0),
+# the magnetic helicity, which no COCOS relabelling may do (IP = TOR =
+# σ_RφZ,in·σ_RφZ,out = +1 for every 3→11 transform). It was self-certifying:
+# because σ_Ip appears once in each of OMAS' σ_Bp and σ_ρθφ tests, flipping ip
+# flips both together, so `identify_cocos` returned [1, 11] by construction.
+# Measured: native data returns [4, 14, 3, 13] on all three machines tested.
 function _cocos11_meta(meta, results)
     isempty(results) && return meta
-    g = meta.globals
-    ip = get(g, :ip, nothing)
-    if ip !== nothing
-        σ = 0.0
-        for (k, s) in enumerate(results)
-            span = s.psi_boundary - s.psi_axis
-            if isfinite(span) && span != 0 && isfinite(ip[k]) && ip[k] != 0
-                σ = sign(span) * sign(ip[k])
-                break
-            end
-        end
-        if σ < 0
-            g = merge(g, (; ip = -ip))
-        elseif σ == 0.0
-            @warn "export_imas: could not orient ip against the ψ map; toroidal_current written as-is"
-        end
-    end
     b0 = meta.b0
     F = first(results).F1d
     if isfinite(b0) && F !== nothing
         fs = filter(isfinite, F)
         isempty(fs) || (b0 = sign(last(fs)) * abs(b0))
     end
-    return merge(meta, (; globals = g, b0 = b0))
+    return merge(meta, (; b0 = b0))
 end
 
 function _with_vacuum_field(file::M3DC1File, norm::M3DNormalization, meta)

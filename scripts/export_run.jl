@@ -18,6 +18,9 @@
 #   --nbins=128         FSA radial bins
 #   --ngrid=200         R-Z evaluation grid (ngrid × ngrid)
 #   --cocos=mhdsimdb    mhdsimdb (NIMROD-DB drop-in, default) | 11 (standard IMAS) | raw (per-radian)
+#   --cocos11=true      also write M3DC1_axisym_cocos11.h5, the same export relabelled
+#                       to standard IMAS COCOS-11 (default: true when --cocos=mhdsimdb).
+#                       Shares the reduction, so it costs one extra write, not a re-run.
 #   --fsa=cumulative    ratio-profile FSA estimator: cumulative (smooth, default) | bin (raw)
 #   --fsa_window=4      cumulative regression window (smaller = follows pedestal tighter)
 #   --pulse=<int>       dataset_description.data_entry.pulse
@@ -59,7 +62,7 @@ function main(args)
     end
     isempty(input) && error(
         "usage: export_run <run_dir | C1.h5> [--outdir=<path>] [--ascot=true|false] " *
-            "[--nbins= --ngrid= --cocos= --fsa= --fsa_window= --slices= --pulse=]"
+            "[--nbins= --ngrid= --cocos= --cocos11= --fsa= --fsa_window= --slices= --pulse=]"
     )
 
     # Resolve the C1.h5 path: accept either a folder or the file itself.
@@ -101,20 +104,31 @@ function main(args)
             a in ("false", "off", "no", "0") ? false :
             error("--ascot must be true|false, got $a")
     end
+    # Optional COCOS-11 twin of the same export. ON by default when the primary
+    # output is the (mixed-convention) MHDsimDB layout: the reduction is shared,
+    # so the twin costs one extra write, and it saves a full re-run if a
+    # consumer turns out to want IMAS-standard psi.
+    want_c11 = let a = get(opts, "cocos11", cocos === :mhdsimdb ? "true" : "false")
+        a in ("true", "on", "yes", "1") ? true :
+            a in ("false", "off", "no", "0") ? false :
+            error("--cocos11 must be true|false, got $a")
+    end
+    cocos11_out = want_c11 ? joinpath(out_folder, "M3DC1_axisym_cocos11.h5") : ""
 
     file = M3DC1File(c1)
     all_slices = list_timeslices(file)
     slices = haskey(opts, "slices") ?
         parse.(Int, split(opts["slices"], ',')) : all_slices
 
-    @info "M3DC1Reader export" run = rundir out_folder = out_folder slices = length(slices) nbins ngrid cocos pulse fsa_method fsa_window ascot5
+    @info "M3DC1Reader export" run = rundir out_folder = out_folder slices = length(slices) nbins ngrid cocos pulse fsa_method fsa_window ascot5 cocos11 = want_c11
 
     export_imas(
         file, out;
         slices = slices, nbins = nbins, ngrid = ngrid,
         cocos = cocos, pulse = pulse,
         fsa_method = fsa_method, fsa_window = fsa_window,
-        ascot5 = ascot5, ascot5_dir = joinpath(out_folder, "ascot"), verbose = true
+        ascot5 = ascot5, ascot5_dir = joinpath(out_folder, "ascot"),
+        cocos11_path = cocos11_out, verbose = true
     )
 
     return out
